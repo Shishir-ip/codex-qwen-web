@@ -1,13 +1,13 @@
-// Playwright-based best-effort Qwen Web adapter (experimental)
-// This implementation runs unauthenticated, headless, and uses heuristic selectors.
-// It is intended as a prototype only. Improve selectors and integrate with the
-// launcher's embedded browser host for production-quality behavior.
+// Improved Playwright-based unauthenticated Qwen Web adapter prototype
+// - Uses heuristic selectors but adds more robust discovery, retries, and configurable headful mode.
+// - Streams incremental text by polling the last assistant message with stricter heuristics.
+// - Intended for local development only. Integrate with launcher/browser-host for production.
 
 import { chromium } from "playwright-core";
 
 export function createQwenWebAdapter(provider: any) {
   return {
-    runTurn: async function runTurn(parsedRequest: any, context: { headers?: Headers; abortSignal?: AbortSignal }, onEvent: (e: any) => void) {
+    runTurn: async function runTurn(parsedRequest: any, context: { headers?: Headers; abortSignal?: AbortSignal } = {}, onEvent: (e: any) => void) {
       const abortSignal = context?.abortSignal;
       if (abortSignal?.aborted) {
         onEvent({ type: "error", message: "Turn aborted before start" });
@@ -17,6 +17,10 @@ export function createQwenWebAdapter(provider: any) {
       const url = "https://chat.qwen.ai/";
       let browser: any = null;
       let page: any = null;
+
+      const HEADFUL = Boolean(process.env.QWEN_HEADFUL && process.env.QWEN_HEADFUL !== "0");
+      const MAX_COMPOSER_WAIT_MS = Number(process.env.QWEN_COMPOSER_WAIT_MS ?? 15000);
+      const MAX_RESPONSE_WAIT_MS = Number(process.env.QWEN_RESPONSE_WAIT_MS ?? 90000);
 
       const composerSelectors = [
         'textarea',
@@ -30,76 +34,92 @@ export function createQwenWebAdapter(provider: any) {
         'button[aria-label*="send"]',
         'button[type="submit"]',
         'button:has(svg)',
+        'button[title*="Send"]',
       ];
       const messageContainerCandidates = [
+        '[data-role="conversation"]',
+        '.qwen-chat-item',
         '.chat-message',
         '.message',
-        '.qwen-chat-item',
         'main',
         '[role="log"]',
         '.chat-history',
+        '.chat-container',
       ];
 
-      const timeoutMs = 60_000;
-
       try {
-        browser = await chromium.launch({ headless: true });
+        browser = await chromium.launch({ headless: !HEADFUL });
         const context = await browser.newContext();
         page = await context.newPage();
-        // Navigate
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-        // Wait a bit for dynamic app to hydrate
-        await page.waitForTimeout(1000);
+        // Wait briefly for SPA hydration
+        await page.waitForTimeout(800);
 
-        // Find composer
+        // Try to discover the composer element with a short loop
         let composerHandle: any = null;
-        for (const sel of composerSelectors) {
-          try {
-            composerHandle = await page.$(sel);
-            if (composerHandle) break;
-          } catch {}
+        const composerStart = Date.now();
+        while (!composerHandle && (Date.now() - composerStart) < MAX_COMPOSER_WAIT_MS) {
+          for (const sel of composerSelectors) {
+            try {
+              const h = await page.$(sel);
+              if (h) {
+                // Heuristic: ensure it's visible and editable
+                const visible = await h.isVisible().catch(() => false);
+                const editable = await page.evaluate(el => (el as HTMLElement).isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT', h).catch(() => false);
+                if (visible && editable) { composerHandle = h; break; }
+              }
+            } catch {}
+          }
+          if (!composerHandle) await page.waitForTimeout(300);
         }
 
         if (!composerHandle) {
-          onEvent({ type: 'error', message: 'Could not find composer element on Qwen page (unauthenticated probe).' });
+          onEvent({ type: 'error', message: 'Composer element not found within timeout (unauthenticated probe).' });
           await browser.close();
           return;
         }
 
-        // Focus and populate composer. Different element shapes handled.
-        const prompt = (parsedRequest && parsedRequest._rawBody && parsedRequest._rawBody.input)
-          ? String(parsedRequest._rawBody.input?.map((i: any) => typeof i === 'string' ? i : (i?.text ?? '')).join('\n') || '')
-          : (typeof parsedRequest === 'string' ? parsedRequest : JSON.stringify(parsedRequest));
+        // Build prompt text from parsedRequest as a best-effort
+        const prompt = (() => {
+          if (parsedRequest && typeof parsedRequest === 'object') {
+            try {
+              const raw = parsedRequest._rawBody ?? parsedRequest;
+              if (raw && Array.isArray(raw.input)) return raw.input.map(i => (typeof i === 'string' ? i : i?.text ?? '')).join('\n');
+              if (typeof parsedRequest === 'string') return parsedRequest;
+              const maybe = parsedRequest.input ?? parsedRequest.message ?? parsedRequest.prompt;
+              if (typeof maybe === 'string') return maybe;
+            } catch {}
+            return JSON.stringify(parsedRequest).slice(0, 4000);
+          }
+          return String(parsedRequest ?? '').slice(0, 4000);
+        })();
 
-        // Try standard fill
+        // Focus and type into composer. Use typing with a small delay to mimic human input.
         try {
-          await composerHandle.focus();
-          // Use keyboard typing to avoid some SPA anti-cheat, but keep it fast
-          await page.keyboard.type(prompt, { delay: 5 });
+          await composerHandle.click({ clickCount: 1 });
+          await page.keyboard.type(prompt, { delay: 8 });
         } catch (e) {
-          // Fallback: set innerText/content via JS and dispatch input
+          // Fallback: write into the element via JS and dispatch events
           await page.evaluate((el, text) => {
-            if (el.isContentEditable) {
-              el.innerText = text;
-            } else if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+            if ((el as HTMLElement).isContentEditable) {
+              (el as HTMLElement).innerText = text;
+            } else if ((el as HTMLTextAreaElement).tagName === 'TEXTAREA' || (el as HTMLInputElement).tagName === 'INPUT') {
               (el as HTMLTextAreaElement).value = text;
               el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
             } else {
-              el.textContent = text;
+              (el as HTMLElement).textContent = text;
             }
-            // Dispatch input/change events
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
           }, composerHandle, prompt);
         }
 
-        // Find and click send
+        // Find and activate send
         let sendHandle: any = null;
         for (const sel of sendSelectors) {
           try {
-            sendHandle = await page.$(sel);
-            if (sendHandle) break;
+            const h = await page.$(sel);
+            if (h && await h.isVisible().catch(() => false)) { sendHandle = h; break; }
           } catch {}
         }
         if (sendHandle) {
@@ -109,66 +129,62 @@ export function createQwenWebAdapter(provider: any) {
           await page.keyboard.press('Enter');
         }
 
-        // Stream observation: poll for last message text changes from candidate containers
+        // Streaming: poll for the last assistant message text. Use stricter candidates and stable-check logic.
         let lastText = '';
-        let stableCount = 0;
-        const maxStable = 3; // require several polls of no-change to treat as complete
-        const pollInterval = 400;
-        const maxWait = 60_000; // max total wait for a response
-        let waited = 0;
+        let unchangedIterations = 0;
+        const stableThreshold = 3;
+        const pollInterval = 350;
+        let elapsed = 0;
 
-        while (true) {
+        while (elapsed < MAX_RESPONSE_WAIT_MS) {
           if (abortSignal?.aborted) {
             onEvent({ type: 'error', message: 'Turn aborted' });
-            try { await browser.close(); } catch {}
+            await browser.close();
             return;
           }
 
-          // Try to find candidate message text
-          const candidateText = await page.evaluate((candidates) => {
-            function innerTextOf(el: Element | null) {
-              if (!el) return '';
-              try { return el.textContent || ''; } catch { return ''; }
-            }
-            for (const sel of candidates) {
-              try {
-                const node = document.querySelector(sel);
-                if (node && node.textContent && node.textContent.trim()) return node.textContent.trim();
-              } catch {}
-            }
-            // fallback: find last visible text node under any major container
-            const roots = document.querySelectorAll('main, [role="main"], .chat, .chat-history, .chat-container');
-            for (const r of Array.from(roots)) {
-              const texts = Array.from(r.querySelectorAll('*')).map(n => n.textContent || '').filter(t => t.trim());
-              if (texts.length) return texts[texts.length - 1].trim();
-            }
+          const candidateText: string = await page.evaluate((candidates) => {
+            // Prefer explicit assistant message markers if present
+            const assistantSelectors = [
+              '[data-role="assistant"]',
+              '.assistant',
+              '.qwen-assistant',
+              '.reply',
+            ];
+            try {
+              for (const s of assistantSelectors.concat(candidates)) {
+                const el = document.querySelector(s);
+                if (el && el.textContent && el.textContent.trim()) return el.textContent.trim();
+              }
+              // fallback: find the last large text node in main containers
+              const roots = document.querySelectorAll('main, [role="main"], .chat, .chat-history, .chat-container');
+              for (const r of Array.from(roots)) {
+                const nodes = Array.from(r.querySelectorAll('*')).filter(n => (n.textContent || '').trim().length > 20);
+                if (nodes.length) return (nodes[nodes.length - 1].textContent || '').trim();
+              }
+            } catch (e) {}
             return '';
-          }, messageContainerCandidates);
+          }, messageContainerCandidates).catch(() => '');
 
           if (candidateText && candidateText !== lastText) {
-            // new content observed
             const chunk = candidateText.startsWith(lastText) ? candidateText.slice(lastText.length) : candidateText;
             lastText = candidateText;
-            stableCount = 0;
+            unchangedIterations = 0;
             onEvent({ type: 'response-chunk', text: chunk });
-          } else if (!candidateText && !lastText) {
-            // not yet started
           } else {
-            // no change observed
-            stableCount += 1;
+            unchangedIterations += 1;
+            if (unchangedIterations >= stableThreshold && lastText) {
+              onEvent({ type: 'completed' });
+              break;
+            }
           }
 
-          if (stableCount >= maxStable && lastText) {
-            onEvent({ type: 'completed' });
-            break;
-          }
-
-          waited += pollInterval;
-          if (waited > maxWait) {
-            onEvent({ type: 'error', message: 'Timed out waiting for response' });
-            break;
-          }
           await page.waitForTimeout(pollInterval);
+          elapsed += pollInterval;
+        }
+
+        if (elapsed >= MAX_RESPONSE_WAIT_MS) {
+          onEvent({ type: 'error', message: 'Timed out waiting for response' });
         }
 
         try { await browser.close(); } catch {}
@@ -177,6 +193,6 @@ export function createQwenWebAdapter(provider: any) {
         const message = error instanceof Error ? error.message : String(error);
         onEvent({ type: 'error', message });
       }
-    },
+    }
   };
 }
