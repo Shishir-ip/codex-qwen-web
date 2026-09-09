@@ -1,0 +1,20 @@
+{
+  "name": "codex-qwen-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop control center scaffold for Codex Qwen Web",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "echo \"launcher dev placeholder\"",
+    "package": "echo \"launcher package placeholder\""
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT"
+}
