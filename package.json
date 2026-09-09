@@ -8,7 +8,8 @@
   "scripts": {
     "probe:qwen": "node ./tests/qwen-probe.ts",
     "typecheck": "tsc --noEmit",
-    "driver": "bun run tests/driver.ts"
+    "driver": "node ./tests/driver.ts",
+    "smoke:host": "bash ./scripts/smoke-host-integration.sh"
   },
   "devDependencies": {
     "typescript": "5.9.3",
