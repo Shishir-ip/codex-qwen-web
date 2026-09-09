@@ -1,0 +1,23 @@
+{
+  "name": "codex-qwen-web",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Codex bridge adapted to run Qwen Web (chat.qwen.ai) as native Codex models — scaffold of miuuyy/codex-chatgpt-web",
+  "repository": "https://github.com/Shishir-ip/codex-qwen-web",
+  "type": "module",
+  "scripts": {
+    "probe:qwen": "node ./tests/qwen-probe.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "playwright-core": "^1.62.0"
+  },
+  "keywords": [
+    "codex",
+    "qwen",
+    "chatqwen",
+    "automation"
+  ],
+  "license": "MIT"
+}
