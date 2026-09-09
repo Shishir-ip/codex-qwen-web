@@ -1,45 +1,81 @@
 # codex-qwen-web
 
-A fork-style scaffold of miuuyy/codex-chatgpt-web adapted to add a Qwen Web adapter (chat.qwen.ai).
+A scaffold of `miuuyy/codex-chatgpt-web` adapted for an unauthenticated Qwen Web (`https://chat.qwen.ai/`) adapter.
 
-Goal
-- Let Codex run Qwen Web chats as routed/native Codex models by automating an authenticated browser session, streaming responses back into the Responses protocol, and (optionally) wiring MCP tool calls.
+## Security and scope
 
-This repository is an initial scaffold for exploration and development. It mirrors the upstream layout and provides a prototype adapter and a Playwright probe to collect DOM selectors for automation.
+- Do not store secrets in this repository.
+- The adapter wiring in this branch does **not** sign in automatically.
+- For authenticated testing, provide a signed-in launcher/browser profile externally.
 
-Security & policy
-- This project automates a web UI. Verify the target site's terms of service before proceeding.
-- Do not store secrets in the repository. Use ephemeral storage-state files or local runtime keys for testing.
+## BrowserHost contract
 
-What is included in this branch
-- README.md (this file)
-- package.json (minimal, adjusted metadata)
-- launcher/package.json (adjusted metadata for the launcher)
-- src/adapters/chatqwen-web.ts — adapter prototype (unauthenticated, heuristic selectors)
-- tests/qwen-probe.ts — Playwright probe script to run locally to discover selectors and verify automation
+The Qwen adapter uses a `BrowserHost` abstraction (`/src/browser-host.ts`):
 
-How to run the probe locally
+- `openTab(url: string): Promise<{ tabId: string }>`
+- `runInTab(tabId, { action: "fillAndSend", prompt })`
+- `observeTab(tabId, handlers): () => void`
+- `closeTab(tabId)`
+- `onceTabComplete(tabId, cb)`
 
-1. Clone and install dependencies:
+`LauncherDescriptor` shape:
 
-   git clone https://github.com/Shishir-ip/codex-qwen-web
-   cd codex-qwen-web
-   npm install
-   npx playwright install
+- `controlSocket?: string` (UNIX domain socket for JSON-RPC control)
+- `url?: string` (HTTP control server)
+- optional: `rpcPath`, `eventsPath`, `token`, `headers`, `timeoutMs`, `reconnectAttempts`
 
-2. Run the headful probe to inspect the UI and save a screenshot:
+## Launcher integration
 
-   node tests/qwen-probe.ts
+`src/launcher-browser-host-adapter.ts` implements `buildLauncherHostAdapter(descriptor)` with two modes:
 
-3. Inspect tests/qwen-screenshot.png and the console output to refine selectors. For authenticated flows, run the probe in a session that is already signed in.
+1. `controlSocket`: JSON-RPC over UNIX socket (`openTab`, `runInTab`, `observeTab`, `closeTab`)
+2. `url`: HTTP control endpoints + SSE tab event streaming
 
-Run the adapter prototype (unauthenticated, headless by default)
+Streaming events are forwarded as response chunks/completion/error and include reconnect + timeout handling.
 
-The adapter is a Playwright-based prototype that runs unauthenticated. It is not integrated into the launcher runtime and is only useful for development and selector discovery.
+## Local development (mock host)
 
-You can exercise it by writing a small driver that imports the adapter and calls runTurn with a short prompt. Example (node + ts-node / bun):
+A Playwright mock BrowserHost lives at `tests/mock-launcher-host.ts`. It opens a real browser page, fills/sends prompts, and streams mutations.
 
-- Set QWEN_HEADFUL=1 to see the browser during runs.
+Driver behavior (`tests/driver.ts`):
 
-Security & policy reminder
-- Automating a web UI may trigger anti-bot measures and may be restricted by the provider’s terms. Ensure you have the right to automate your account before proceeding.
+1. If launcher descriptor is provided, it uses the launcher adapter.
+2. Otherwise it falls back to the mock BrowserHost.
+
+Launcher descriptor env options:
+
+- `QWEN_LAUNCHER_DESCRIPTOR='{"url":"http://127.0.0.1:3000"}'`
+- `QWEN_LAUNCHER_CONTROL_SOCKET=/path/to/launcher.sock`
+- `QWEN_LAUNCHER_URL=http://127.0.0.1:3000`
+
+Set `QWEN_HEADFUL=1` to keep browser windows visible in local runs.
+
+## Commands
+
+```bash
+npm install
+npx playwright install
+```
+
+Probe selectors (headful):
+
+```bash
+node tests/qwen-probe.ts
+```
+
+Run adapter driver:
+
+```bash
+QWEN_HEADFUL=1 bun run tests/driver.ts
+```
+
+Run local smoke wiring test (mock host + driver, exits non-zero on failure):
+
+```bash
+npm run smoke:host
+```
+
+## TODOs
+
+- Validate against the real launcher endpoint contract and event schema.
+- Perform authenticated end-to-end testing with a signed-in launcher profile.
